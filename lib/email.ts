@@ -1,9 +1,36 @@
 import { env } from "./env";
 
+import nodemailer from "nodemailer";
+
 type Attachment = { filename: string; path: string };
 
-/** Send through Resend's REST API. */
+/** Gmail SMTP is used when GMAIL_USER + GMAIL_APP_PASSWORD are set: it can email any address. */
+export const usingGmail = () => !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+
+let transport: nodemailer.Transporter | null = null;
+function gmail() {
+  transport ??= nodemailer.createTransport({
+    host: "smtp.gmail.com", port: 465, secure: true,
+    auth: { user: process.env.GMAIL_USER!, pass: process.env.GMAIL_APP_PASSWORD!.replace(/\s+/g, "") },
+  });
+  return transport;
+}
+
+/** Send through Gmail SMTP if configured, otherwise Resend's REST API. */
 export async function sendEmail(opts: { to: string; subject: string; html: string; text: string; attachments?: Attachment[] }) {
+  if (usingGmail()) {
+    const attachments = await Promise.all((opts.attachments ?? []).map(async (a) => {
+      const r = await fetch(a.path);
+      if (!r.ok) throw new Error(`Attachment ${a.filename}: HTTP ${r.status}`);
+      return { filename: a.filename, content: Buffer.from(await r.arrayBuffer()), contentType: "application/pdf" };
+    }));
+    const info = await gmail().sendMail({
+      from: `"${process.env.EMAIL_FROM_NAME || "Aangan Studio"}" <${process.env.GMAIL_USER}>`,
+      replyTo: process.env.EMAIL_REPLY_TO || process.env.GMAIL_USER,
+      to: opts.to, subject: opts.subject, html: opts.html, text: opts.text, attachments,
+    });
+    return info.messageId as string;
+  }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${env("RESEND_API_KEY")}`, "Content-Type": "application/json" },
@@ -43,12 +70,13 @@ export function handoffEmail(o: {
 }
 
 /**
- * Resend's sandbox sender (onboarding@resend.dev) can only deliver to the account owner.
- * Until a domain is verified, client emails go to the front desk with a banner saying
+ * With Gmail SMTP configured, client emails go straight to the client.
+ * Resend's sandbox sender (onboarding@resend.dev) can only deliver to the account owner, so
+ * without Gmail (and without a verified domain) client emails go to the front desk with a banner saying
  * who they were meant for, so the demo still shows exactly what the client receives.
  */
 export function clientRecipient(clientEmail: string): { to: string; demoFor: string | null } {
-  const sandbox = /resend\.dev/i.test(process.env.EMAIL_FROM ?? "");
+  const sandbox = !usingGmail() && /resend\.dev/i.test(process.env.EMAIL_FROM ?? "");
   const override = process.env.CLIENT_EMAIL_OVERRIDE;
   if (override) return { to: override, demoFor: clientEmail };
   if (sandbox) return { to: env("FRONT_DESK_EMAIL"), demoFor: clientEmail };
