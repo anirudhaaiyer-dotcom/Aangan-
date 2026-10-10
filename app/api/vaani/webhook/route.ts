@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { env, optionalEnv } from "@/lib/env";
 import { isAfterHours, normalise, verifyRequest } from "@/lib/vaani";
-import { classifyCall } from "@/lib/gemini";
-import { sendEmail, handoffEmail } from "@/lib/email";
+import { classifyWithFallback } from "@/lib/gemini";
+import { sendEmail, handoffEmail, clientEmail, clientRecipient, portfolioAttachment } from "@/lib/email";
 import { actionUrl } from "@/lib/links";
 import { createDeal } from "@/lib/hubspot";
 
@@ -61,6 +61,7 @@ export async function POST(req: NextRequest) {
     transcript: call.transcript,
     booked_slot: call.bookedSlot,
     cost_voice_inr: voiceCost,
+    client_email: call.clientEmail,
   }).filter(([, v]) => v !== null && v !== undefined && v !== ""));
   const { data: row, error } = await supa.from("calls").upsert(base, { onConflict: "vaani_call_id" }).select("id, caller_number, started_at").single();
   if (error) throw error;
@@ -84,24 +85,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, classified: "unclear" });
   }
 
-  // If the AI step fails, never lose the lead: log the error and send the raw call to the front desk.
-  let classified;
-  try {
-    classified = await classifyCall(call);
-  } catch (e: any) {
-    const reason = `AI step failed: ${String(e?.message ?? e).slice(0, 300)}`;
-    await supa.from("calls").update({ classification: "unclear", fit_reason: reason }).eq("id", row.id);
-    try {
-      const { html, text } = handoffEmail({
-        heading: "New call: AI could not classify it, please review",
-        facts: [["Phone", call.callerNumber], ["Duration", `${Math.round(call.durationSec / 60)} min`]],
-        note: [call.summary, "", ...call.transcript.map((t) => `${t.role}: ${t.text}`)].join("\n"),
-        buttons: call.recordingUrl ? [{ label: "Recording", url: call.recordingUrl }] : [],
-      });
-      await sendEmail({ to: env("FRONT_DESK_EMAIL"), subject: `[Review] Call from ${call.callerNumber ?? "unknown"}`, html, text });
-    } catch {}
-    return NextResponse.json({ ok: false, error: reason }, { status: 200 });
-  }
+  // Never lose a lead: Gemini first, then a second model if configured, then keyword rules.
+  const classified = await classifyWithFallback(call);
   const { result, costInr } = classified;
 
   // Route: match designer by segment, then the one with the fewest leads this week.
@@ -121,6 +106,7 @@ export async function POST(req: NextRequest) {
   }
 
   const L = result.lead;
+  const email = call.clientEmail ?? (L.email && L.email.includes("@") ? L.email.toLowerCase() : null);
   const update: Record<string, unknown> = {
     classification: result.classification,
     fit_reason: result.fit_reason,
@@ -128,6 +114,8 @@ export async function POST(req: NextRequest) {
     handoff_note: result.handoff_note,
     designer_id: designer?.id ?? null,
     cost_llm_inr: costInr,
+    classified_by: classified.engine,
+    ai_error: classified.aiError ?? null,
   };
 
   // Outputs. Each is best-effort so one failing service doesn't lose the lead.
@@ -143,7 +131,7 @@ export async function POST(req: NextRequest) {
     const { html, text } = handoffEmail({
       heading: slot ? `New consultation: ${slot}` : "New qualified lead (no slot booked)",
       facts: [
-        ["Client", L.name], ["Phone", call.callerNumber], ["Area", L.area], ["Property", L.property_type],
+        ["Client", L.name], ["Phone", call.callerNumber], ["Email", email ?? "Not captured: call to send the portfolio"], ["Area", L.area], ["Property", L.property_type],
         ["Size", L.size_sqft ? `~${L.size_sqft} sq ft` : null], ["Scope", L.scope],
         ["Budget band", L.budget_band], ["Timeline", L.timeline],
         ["Assigned to", designer?.name ?? "Unassigned, first to claim takes it"],
@@ -169,6 +157,79 @@ export async function POST(req: NextRequest) {
         dealName: `${L.name ?? "Caller"} · ${L.property_type ?? "Interiors"} · ${L.area ?? "Pune"}`,
         description: result.handoff_note,
       });
+    } catch (e: any) { errors.push(e.message); }
+
+    // Follow-up to the client: confirmation, about Aangan, portfolio, and a reschedule link.
+    if (email) try {
+      const r = clientRecipient(email);
+      const msg = clientEmail({
+        demoFor: r.demoFor, greetingName: L.name,
+        heading: slot ? "Your consultation with Aangan Studio" : "Thanks for calling Aangan Studio",
+        paragraphs: slot
+          ? ["Thanks for calling us. Your designer will have everything you told us, so you won't have to repeat yourself."]
+          : ["Thanks for calling us. Pick a time for your free consultation below; your designer will have everything you told us."],
+        slot,
+        buttons: [
+          ...(!slot && optionalEnv("CALCOM_BOOKING_URL") ? [{ label: "Book your consultation", url: process.env.CALCOM_BOOKING_URL! }] : []),
+          ...(slot ? [{ label: "Can't make it? Reschedule", url: actionUrl(row.id, "client-reschedule") }] : []),
+        ],
+        aboutAangan: true,
+      });
+      update.client_message_id = await sendEmail({
+        to: r.to, subject: slot ? `Your Aangan consultation: ${slot}` : "Thanks for calling Aangan Studio",
+        html: msg.html, text: msg.text, attachments: [portfolioAttachment()],
+      });
+      update.client_email_sent_at = new Date().toISOString();
+      update.client_email = email;
+    } catch (e: any) { errors.push(e.message); }
+  }
+
+  if (result.classification === "reschedule") {
+    // Link to the caller's existing booking (same phone number, most recent booked call).
+    const { data: prev } = await supa.from("calls")
+      .select("id, booked_slot, designer_id, client_email, handoff_note")
+      .eq("caller_number", call.callerNumber ?? "__none__").neq("id", row.id)
+      .not("booked_slot", "is", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
+    update.linked_call_id = prev?.id ?? null;
+    const newSlot = call.bookedSlot ? fmtSlot(call.bookedSlot) : null;
+    const oldSlot = prev?.booked_slot ? fmtSlot(prev.booked_slot) : null;
+    if (prev) {
+      await supa.from("calls").update(newSlot
+        ? { booked_slot: call.bookedSlot, reschedule_requested_at: null, claimed_by: null, claimed_at: null }
+        : { reschedule_requested_at: new Date().toISOString(), callback_done_at: null }).eq("id", prev.id);
+    }
+    let to = frontDesk;
+    if (prev?.designer_id) {
+      const { data: d } = await supa.from("designers").select("email").eq("id", prev.designer_id).single();
+      to = d?.email ?? to;
+    }
+    try {
+      const { html, text } = handoffEmail({
+        heading: newSlot ? `Consultation moved to ${newSlot}` : "Client can't make their consultation",
+        facts: [["Phone", call.callerNumber], ["Was booked for", oldSlot ?? "No booking found for this number"], ["New time", newSlot ?? "Not agreed yet: call to rebook"]],
+        note: result.handoff_note,
+        buttons: prev ? [{ label: "Claim this lead", url: actionUrl(prev.id, "claim") }] : [],
+        footer: newSlot ? "The agent moved it on the call. Please re-claim to confirm." : "It's on the call-back list until someone rebooks it.",
+      });
+      await sendEmail({ to, subject: newSlot ? `[Moved] ${call.callerNumber ?? "Client"} → ${newSlot}` : `[Reschedule] ${call.callerNumber ?? "Client"} can't make ${oldSlot ?? "their slot"}`, html, text });
+    } catch (e: any) { errors.push(e.message); }
+    const cEmail = email ?? prev?.client_email ?? null;
+    if (cEmail) try {
+      const r = clientRecipient(cEmail);
+      const msg = clientEmail({
+        demoFor: r.demoFor, greetingName: L.name,
+        heading: newSlot ? "Your consultation has moved" : "No problem, let's find a new time",
+        paragraphs: newSlot
+          ? [`Thanks for letting us know. We've moved your consultation${oldSlot ? ` from ${oldSlot}` : ""}.`]
+          : [`Thanks for letting us know${oldSlot ? ` that ${oldSlot} doesn't work` : ""}. Pick a new time below, or reply with what suits you and your designer will call to confirm.`],
+        slot: newSlot,
+        buttons: [
+          ...(!newSlot && optionalEnv("CALCOM_BOOKING_URL") ? [{ label: "Pick a new time", url: process.env.CALCOM_BOOKING_URL! }] : []),
+          ...(prev ? [{ label: newSlot ? "Need to change it again?" : "Ask the studio to call me", url: actionUrl(prev.id, "client-reschedule") }] : []),
+        ],
+      });
+      update.client_message_id = await sendEmail({ to: r.to, subject: newSlot ? `Your Aangan consultation moved to ${newSlot}` : "Let's find a new time for your Aangan consultation", html: msg.html, text: msg.text });
+      update.client_email_sent_at = new Date().toISOString();
     } catch (e: any) { errors.push(e.message); }
   }
 
