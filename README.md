@@ -8,13 +8,14 @@ It answers every call to the studio number, day or night, qualifies the caller a
 ## How a call flows
 
 ```
-📞 Call ──► Vaani Labs voice agent ──► intake + qualify + book slot (live, on the call)
+📞 Call ──► Vaani AI voice agent ──► intake + qualify + book slot (live, on the call)
                  │
-                 ▼  webhook: call.completed
-        /api/vaani/webhook  (this app, on Vercel)
-                 │  verify signature → log to Supabase
+                 ▼  webhooks: call_started, call_postprocessing
+        /api/vaani/webhook?token=…  (this app, on Vercel)
+                 │  check token → log to Supabase
                  ▼
         Gemini Flash classifies against knowledge/qualified.md
+        (backup: a second model, then keyword rules, so no call is ever lost)
                  │
    ┌─────────────┼───────────────┬─────────────────┐
 qualified     not a fit       complaint          unclear
@@ -70,7 +71,15 @@ docs/                    Case brief, nine checks, component map
 
 ## Dashboard metrics
 
-Calls answered · after-hours calls · qualified · consultations booked · show-ups · projects won (₹) · cost to run (voice + AI) · cost per booking.
+Needs a call back · calls answered · after-hours calls · qualified · consultations booked · show-ups · projects won (₹) · cost to run (voice + AI) · cost per booking · time to claim · asked about price · repeat callers · AI health.
+
+**Call-back list:** every call where a person still has to pick up the phone. That covers dropped calls, complaints, qualified callers with no slot, bookings no designer claimed within 2 hours, reschedule requests, and unclear calls. Each row has a "Mark done" button.
+
+## Testing (no side effects)
+
+`POST /api/eval?token=<EVAL_TOKEN>` with `{ "id": "T01", "transcript": "..." }` or an array of up to 10.
+It accepts "Front Desk:/Caller:", "AGENT:/USER:", WhatsApp threads or plain web-form text, and returns the classification, the deciding criterion, asked_pricing, the handoff note and which engine decided.
+Add `&engine=rules` to test the backup classifier without using Gemini quota. Results on the September set are in `docs/eval-sep-2026.md`.
 Mark `showed_up`, `project_won` and `project_value_inr` on a call row to complete the funnel.
 
 ## Extending to WhatsApp and the web form
