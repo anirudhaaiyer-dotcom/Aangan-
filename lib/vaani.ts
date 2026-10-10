@@ -34,7 +34,23 @@ export type NormalisedCall = {
   transcript: Turn[];
   recordingUrl: string | null;
   bookedSlot: string | null;
+  clientEmail: string | null;
 };
+
+/**
+ * Finds an email address in text, including spoken forms the speech-to-text writes out:
+ * "priya dot joshi at gmail dot com" -> priya.joshi@gmail.com
+ */
+export function findEmail(text: string): string | null {
+  const direct = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  if (direct) return direct[0].toLowerCase();
+  const spoken = text.toLowerCase()
+    .replace(/\s+(at the rate|at the rate of|at)\s+/g, "@")
+    .replace(/\s+(dot|period)\s+/g, ".")
+    .replace(/\s+underscore\s+/g, "_");
+  const m = spoken.match(/[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|in|co\.in|org|net|edu|io|co)\b/);
+  return m ? m[0] : null;
+}
 
 const pick = (o: any, ...keys: string[]) => {
   for (const k of keys) {
@@ -44,13 +60,27 @@ const pick = (o: any, ...keys: string[]) => {
   return undefined;
 };
 
-/** "[13:33:14] AGENT: hi\n\n[13:33:19] USER: hello" -> turns */
+/**
+ * Turns a transcript string into turns. Accepts Vaani's "[13:33:14] AGENT: hi" lines,
+ * the case pack's "Front Desk: / Caller:" lines, WhatsApp-style "4 Sept, 12:03pm — Name: text"
+ * lines, and plain text (a web form or a note), which becomes a single caller turn.
+ */
+const AGENT_RE = /^(AGENT|BOT|ASSISTANT|FRONT ?DESK|RECEPTION(IST)?|STUDIO|AANGAN)$/i;
+const CALLER_RE = /^(USER|CALLER|CUSTOMER|CLIENT|LEAD|HUMAN)$/i;
+const FORM_FIELD = /^(name|phone|email|location|budget|timeline|notes?|project type|carpet area|current state|how did you find us|status|note)$/i;
+const STAMP = /^\s*(\[[^\]]*\]\s*)?(\d{1,2}\s+\w+,?\s+\d{1,2}:\d{2}\s*(am|pm)?\s*(\([^)]*\))?\s*[—-]\s*)?/i;
 export function parseTranscriptString(t: string): Turn[] {
   const turns: Turn[] = [];
-  for (const line of t.split(/\n+/)) {
-    const m = line.match(/^\s*(?:\[[^\]]*\]\s*)?(AGENT|USER|CALLER|BOT|ASSISTANT|CUSTOMER)\s*:\s*(.*)$/i);
-    if (m) turns.push({ role: /^(USER|CALLER|CUSTOMER)$/i.test(m[1]) ? "CALLER" : "AGENT", text: m[2].trim() });
-    else if (line.trim() && turns.length) turns[turns.length - 1].text += " " + line.trim();
+  for (const raw of t.split(/\n+/)) {
+    const line = raw.replace(STAMP, "").trim();
+    if (!line) continue;
+    const m = line.match(/^([A-Za-z][A-Za-z .'-]{0,40}?)\s*:\s*(.*)$/);
+    const who = m?.[1].trim() ?? "";
+    const isPerson = !!m && /^[A-Z]/.test(who) && who.split(" ").length <= 3 && !FORM_FIELD.test(who);
+    if (m && AGENT_RE.test(who)) turns.push({ role: "AGENT", text: m[2].trim() });
+    else if (m && (CALLER_RE.test(who) || isPerson)) turns.push({ role: "CALLER", text: m[2].trim() });
+    else if (turns.length) turns[turns.length - 1].text += " " + line;
+    else turns.push({ role: "CALLER", text: line });
   }
   return turns;
 }
@@ -79,7 +109,7 @@ export function normalise(payload: any): NormalisedCall {
     (endedAt && durationSec ? new Date(new Date(endedAt).getTime() - durationSec * 1000).toISOString() : null);
   const slotGuess = ["booked_slot", "appointment_time", "consultation_slot", "slot", "appointment"]
     .map((k) => entities[k]).find((v) => typeof v === "string" && !isNaN(Date.parse(v as string))) as string | undefined;
-  return {
+  const out: NormalisedCall = {
     vaaniCallId: String(pick(c, "room_name", "id", "callId", "call_id") ?? pick(payload, "room_name", "call_id") ?? crypto.randomUUID()),
     event,
     status: String(pick(c, "status", "end_reason") ?? "unknown"),
@@ -103,7 +133,13 @@ export function normalise(payload: any): NormalisedCall {
       (pick(c, "appointment.startTime", "appointment.start", "booking.start") as string) ??
       slotGuess ??
       null,
+    clientEmail: null,
   };
+  const fromEntities = ["email", "client_email", "email_address", "customer_email"]
+    .map((k) => entities[k]).find((v) => typeof v === "string" && v.includes("@")) as string | undefined;
+  out.clientEmail = fromEntities?.toLowerCase().trim()
+    ?? findEmail(out.transcript.filter((t) => t.role === "CALLER").map((t) => t.text).join(" "));
+  return out;
 }
 
 /** Studio hours are 10am–7pm IST. */

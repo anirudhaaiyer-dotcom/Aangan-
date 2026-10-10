@@ -11,8 +11,8 @@ export function verify(callId: string, action: string, sig: string | null): bool
   const b = Buffer.from(sig);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-export function actionUrl(callId: string, action: "claim" | "reschedule", by?: string): string {
-  const u = new URL(`/api/lead/${action}`, env("APP_URL"));
+export function actionUrl(callId: string, action: "claim" | "reschedule" | "client-reschedule", by?: string): string {
+  const u = new URL(action === "client-reschedule" ? "/api/client/reschedule" : `/api/lead/${action}`, env("APP_URL"));
   u.searchParams.set("id", callId);
   u.searchParams.set("sig", sign(callId, action));
   if (by) u.searchParams.set("by", by);
